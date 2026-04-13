@@ -1,14 +1,23 @@
 package com.example.myapplication
 
-import androidx.appcompat.app.AppCompatActivity
+import android.content.ContentValues
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.widget.TextView
-import com.example.myapplication.databinding.ActivityMainBinding
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Base64
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
+import com.example.myapplication.databinding.ActivityMainBinding
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
@@ -20,124 +29,148 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Example of a call to a native method
-        binding.sampleText.text = stringFromJNI()
-
-        // Configuração completa do WebView para suportar logins e sites modernos
+        // Configuração do WebView
         val webSettings = binding.webview.settings
         webSettings.javaScriptEnabled = true
-        webSettings.domStorageEnabled = true // ESSENCIAL para logins modernos
-        webSettings.databaseEnabled = true
-        webSettings.loadWithOverviewMode = true
-        webSettings.useWideViewPort = true
-        webSettings.builtInZoomControls = true
-        webSettings.displayZoomControls = false
-        webSettings.setSupportZoom(true)
-        
-        // Define um User-Agent de um navegador real (Chrome no Android)
+        webSettings.domStorageEnabled = true
         webSettings.userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36"
 
-        // Habilitar Cookies
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(binding.webview, true)
-
         binding.webview.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                view?.loadUrl(request?.url.toString())
-                return true
-            }
-            // Para compatibilidade com versões antigas
-            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                url?.let { view?.loadUrl(it) }
-                return true
+            override fun onLoadResource(view: WebView?, url: String?) {
+                super.onLoadResource(view, url)
+                if (url != null && (url.contains(".m3u8") || url.contains(".m3u"))) {
+                    runOnUiThread {
+                        binding.editUrl.setText(url)
+                        binding.sampleText.text = "VÍDEO DETECTADO!"
+                        binding.sampleText.setTextColor(android.graphics.Color.RED)
+                    }
+                }
             }
         }
 
         binding.btnOpenSite.setOnClickListener {
             val url = binding.editUrl.text.toString()
-            if (url.isNotEmpty()) {
-                binding.webview.loadUrl(url)
-            } else {
-                binding.sampleText.text = "Insira uma URL primeiro"
-            }
+            if (url.isNotEmpty()) binding.webview.loadUrl(url)
         }
 
         binding.btnDownload.setOnClickListener {
+            val urlM3u8 = binding.editUrl.text.toString()
+            if (urlM3u8.isEmpty()) return@setOnClickListener
+            
             val user = binding.editUser.text.toString()
             val pass = binding.editPass.text.toString()
-            val urlM3u8 = binding.editUrl.text.toString()
-            
-            if (urlM3u8.isEmpty()) {
-                binding.sampleText.text = "Por favor, insira a URL do M3U8"
-                return@setOnClickListener
-            }
-
-            // Criar o cabeçalho de autenticação (Basic Auth)
             if (user.isNotEmpty() && pass.isNotEmpty()) {
                 val credentials = "$user:$pass"
                 authHeader = "Basic " + Base64.encodeToString(credentials.toByteArray(), Base64.NO_WRAP)
-            } else {
-                authHeader = null
             }
 
-            val pastaDestino = getExternalFilesDir(null)?.absolutePath ?: filesDir.absolutePath
+            val pastaPrivada = getExternalFilesDir(null)?.absolutePath ?: filesDir.absolutePath
             thread {
-                iniciarDownloadNativo(urlM3u8, pastaDestino)
+                iniciarDownloadNativo(urlM3u8, pastaPrivada)
+                // Após o C++ terminar, movemos para a pasta Downloads
+                runOnUiThread { exportarParaDownloads() }
             }
-            binding.sampleText.text = "Baixando via C++: $urlM3u8"
+        }
+
+        binding.btnPlay.setOnClickListener {
+            val file = File(getExternalFilesDir(null), "video_baixado.ts")
+            if (file.exists()) {
+                val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+                val intent = Intent(Intent.ACTION_VIEW)
+                intent.setDataAndType(uri, "video/*")
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                startActivity(intent)
+            } else {
+                Toast.makeText(this, "Baixe o vídeo primeiro!", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (binding.webview.canGoBack()) binding.webview.goBack() else finish()
+            }
+        })
+    }
+
+    private fun exportarParaDownloads() {
+        try {
+            val arquivoOrigem = File(getExternalFilesDir(null), "video_baixado.ts")
+            if (!arquivoOrigem.exists()) return
+
+            val nomeFinal = "Video_Baixado_${System.currentTimeMillis()}.ts"
+            
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, nomeFinal)
+                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp2t")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+            }
+
+            val contentUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            } else {
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            }
+
+            val uri = contentResolver.insert(contentUri, contentValues)
+            uri?.let {
+                contentResolver.openOutputStream(it)?.use { output ->
+                    arquivoOrigem.inputStream().use { input -> input.copyTo(output) }
+                }
+                atualizarStatus("SALVO NA PASTA DOWNLOADS!")
+                Toast.makeText(this, "Vídeo salvo em Downloads!", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            atualizarStatus("Erro ao exportar: ${e.message}")
         }
     }
 
+    fun atualizarStatus(mensagem: String) {
+        runOnUiThread { binding.statusText.text = mensagem }
+    }
+
     /**
-     * Função que o C++ vai chamar para obter os dados da internet (Texto)
+     * Atualiza a barra de progresso (0 a 100)
      */
+    fun atualizarProgresso(atual: Int, total: Int) {
+        runOnUiThread {
+            if (total > 0) {
+                val porcentagem = (atual * 100) / total
+                binding.progressBar.progress = porcentagem
+            }
+        }
+    }
+
     fun baixarTextoDaUrl(url: String): String {
         return try {
-            val connection = URL(url).openConnection() as HttpURLConnection
-            authHeader?.let { connection.setRequestProperty("Authorization", it) }
-            connection.inputStream.bufferedReader().readText()
-        } catch (e: Exception) {
-            "Erro ao baixar texto: ${e.message}"
-        }
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            val cookies = CookieManager.getInstance().getCookie(url)
+            if (cookies != null) conn.setRequestProperty("Cookie", cookies)
+            authHeader?.let { conn.setRequestProperty("Authorization", it) }
+            conn.inputStream.bufferedReader().readText()
+        } catch (e: Exception) { "Erro" }
     }
 
-    /**
-     * Função que o C++ vai chamar para baixar os segmentos do vídeo (Bytes)
-     */
     fun baixarBytesDaUrl(url: String): ByteArray? {
         return try {
-            val connection = URL(url).openConnection() as HttpURLConnection
-            authHeader?.let { connection.setRequestProperty("Authorization", it) }
-            connection.inputStream.readBytes()
-        } catch (e: Exception) {
-            null
-        }
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            val cookies = CookieManager.getInstance().getCookie(url)
+            if (cookies != null) conn.setRequestProperty("Cookie", cookies)
+            authHeader?.let { conn.setRequestProperty("Authorization", it) }
+            conn.inputStream.readBytes()
+        } catch (e: Exception) { null }
     }
 
-    /**
-     * A native method that is implemented by the 'myapplication' native library,
-     * which is packaged with this application.
-     */
     external fun stringFromJNI(): String
-
     external fun iniciarDownloadNativo(url: String, path: String)
 
-    override fun onBackPressed() {
-        if (binding.webview.canGoBack()) {
-            binding.webview.goBack()
-        } else {
-            super.onBackPressed()
-        }
-    }
-
     companion object {
-        // Used to load the 'myapplication' library on application startup.
-        init {
-            System.loadLibrary("myapplication")
-        }
+        init { System.loadLibrary("myapplication") }
     }
 }
